@@ -1,4 +1,3 @@
-
 # Sesión de Estudio — Adeept RaspTank
 > Fecha: 26 de Febrero de 2026
 
@@ -11,6 +10,7 @@
 3. [BufferPos y PWM de Servos](#3-bufferpos-y-pwm-de-servos)
 4. [Cómo Imprimir el PWM de Cada Servo en Consola](#4-cómo-imprimir-el-pwm-de-cada-servo-en-consola)
 5. [Arquitectura Completa con Diagramas](#5-arquitectura-completa-con-diagramas)
+6. Sesión — WebServer, AsyncIO y Flujo del Comando `grab`/`catch`
 
 ---
 
@@ -532,5 +532,123 @@ graph TD
 
 ---
 
-*Documento generado el 26 de Febrero de 2026*
-ENDOFFILE
+## 6. Sesión — WebServer, AsyncIO y Flujo del Comando `grab`/`catch`
+
+> Fecha: sesión actual
+
+### Resumen
+
+Se analizó el flujo completo del comando de agarre del robot, desde el evento en la GUI del cliente hasta el movimiento físico del servo en la Raspberry Pi.
+
+---
+
+### 6.1 Flujo completo del comando `catch` / `grab`
+
+#### Desde la GUI Tkinter (`GUI/GUI.py` y `client/GUI.py`)
+
+```
+Evento del usuario
+  ├── <ButtonPress-1> en Btn_left  →  call_headleft(event)
+  └── <KeyPress-j>                 →  call_headleft(event)
+             │
+             │  tcpClicSock.send(('catch').encode())
+             ▼
+        TCP Socket puerto 10223
+```
+
+#### En el servidor (`server/webServer.py`)
+
+El servidor NO usa TCP clásico para esto — usa **WebSocket** (puerto 8888, librería `websockets` + `asyncio`):
+
+```
+websockets.serve(main_logic, '0.0.0.0', 8888)
+         │
+         └── main_logic(websocket, path)
+                  │
+                  ├── check_permit(websocket)   ← autenticación admin:123456
+                  └── recv_msg(websocket)        ← loop principal de comandos
+                           │
+                           │  data = await websocket.recv()
+                           │
+                           └── robotCtrl(data, response)
+                                    │
+                                    ├── 'grab'  → G_sc.singleServo(15, 1, 3)
+                                    └── 'loose' → G_sc.singleServo(15, -1, 3)
+```
+
+#### En RPIservo.py
+
+```python
+def singleServo(self, ID, direcInput, speedSet):
+    self.wiggleID = ID             # servo 15
+    self.wiggleDirection = direcInput  # 1 = cerrar, -1 = abrir
+    self.scSpeed[ID] = speedSet    # velocidad 3
+    self.scMode = 'wiggle'
+    self.posUpdate()
+    self.resume()                  # desbloquea el hilo → run() → scMove() → moveWiggle()
+```
+
+---
+
+### 6.2 Instancias de ServoCtrl en webServer.py
+
+| Variable  | Servo ID | Controla          |
+|-----------|----------|-------------------|
+| `scGear`  | 0        | Dirección ruedas  |
+| `P_sc`    | 14       | Pan (izq/der)     |
+| `T_sc`    | 11       | Tilt (arriba/abajo)|
+| `H1_sc`   | 12       | Brazo articulación 1 |
+| `H2_sc`   | 13       | Brazo articulación 2 |
+| `G_sc`    | 15       | Gripper (agarre)  |
+
+---
+
+### 6.3 Diferencia entre GUI Tkinter y WebServer
+
+| Aspecto | GUI/client | webServer |
+|---------|-----------|-----------|
+| Protocolo | TCP Socket puerto 10223 | WebSocket puerto 8888 |
+| Comando grab | `'catch'` | `'grab'` |
+| Comando soltar | `'loose'` | `'loose'` |
+| Concurrencia | `threading.Thread` | `asyncio` (event loop) |
+
+> ⚠️ **Nota:** La GUI Tkinter envía `'catch'`, pero `webServer.py` espera `'grab'`. Son dos interfaces distintas para el mismo robot.
+
+---
+
+### 🔴 TODO — Pendientes de Investigar
+
+#### 1. Hilos reales (`threading`) vs hilo del WebSocket (`asyncio`)
+
+- `ServoCtrl` hereda de `threading.Thread` → corre en un **hilo real del SO**
+- `recv_msg` corre en el **event loop de asyncio** → es concurrencia cooperativa, NO hilos reales
+- **Pregunta abierta:** ¿Hay condiciones de carrera entre el event loop de asyncio y los hilos de `ServoCtrl`? ¿Es thread-safe llamar a `G_sc.singleServo()` desde una coroutine de asyncio?
+- Investigar si hace falta usar `asyncio.get_event_loop().run_in_executor()` para las llamadas a servo
+
+#### 2. Imprimir en consola el arreglo de posiciones de servos
+
+- `nowPos` es el array con el PWM real enviado al hardware
+- Actualmente no se imprime en ningún punto del flujo de webServer
+- Opciones a implementar (ver Sección 4 de este archivo):
+  - Opción A: dentro de `scMove()` de `RPIservo.py`
+  - Opción B: método `printServoStatus()` llamado desde `robotCtrl()`
+- **Pendiente:** decidir en qué punto del loop de `recv_msg` conviene imprimir sin saturar la consola
+
+#### 3. `self.nowPos` e `initPos` siempre regresan a valores iniciales
+
+- **Problema observado:** Al imprimir `nowPos` en consola, los valores siempre aparecen en sus valores de inicialización (ej. `300`) aunque el servo físicamente se mueva
+- **Posibles causas a investigar:**
+  - Cada instancia de `ServoCtrl` tiene su **propio array** `nowPos` — puede que se esté leyendo la instancia incorrecta
+  - `posUpdate()` sobreescribe `lastPos` con `nowPos` pero `nowPos` puede no actualizarse en modo `wiggle`
+  - En `moveWiggle()`, `nowPos` se actualiza con `self.nowPos[self.wiggleID]` — verificar si el índice `wiggleID` es el correcto (servo 15 para gripper)
+  - `scGear` llama `moveInit()` pero **no llama `start()`** — podría estar en estado pausado permanente
+  - Verificar que se está imprimiendo la instancia correcta (`G_sc.nowPos` para el gripper, no `scGear.nowPos`)
+
+```python
+# Para debuggear, imprimir la instancia CORRECTA:
+print(f'[G_sc gripper] nowPos[15]: {G_sc.nowPos[15]}')
+print(f'[P_sc pan]     nowPos[14]: {P_sc.nowPos[14]}')
+print(f'[T_sc tilt]    nowPos[11]: {T_sc.nowPos[11]}')
+```
+
+---
